@@ -1,24 +1,66 @@
-FROM php:8.4-fpm
+# syntax=docker/dockerfile:1
+FROM php:8.4-cli
 
-# Instalar dependencias del sistema y extensiones necesarias para Laravel
+# Dependencias del sistema
 RUN apt-get update && apt-get install -y \
     git \
     curl \
+    zip \
+    unzip \
     libpng-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
     libonig-dev \
     libxml2-dev \
     libzip-dev \
-    zip \
-    unzip
+    libicu-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Limpiar cache
-RUN apt-get clean && rm -rf /var/lib/apt/lists/*
+# Extensiones de PHP (MySQL, PostgreSQL, imágenes, zip, etc.)
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install pdo_mysql mysqli pdo_pgsql mbstring exif pcntl bcmath gd zip intl opcache
 
-# Instalar extensiones de PHP necesarias (incluyendo pdo_mysql y zip)
-RUN docker-php-ext-install pdo_mysql mbstring exif pcntl bcmath gd zip
-
-# Obtener Composer desde la imagen oficial
+# Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
-# Establecer directorio de trabajo
+# Node.js 22 + npm (para Vite)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Script de arranque: deja el proyecto listo si falta algo
+RUN <<'EOF'
+cat > /usr/local/bin/entrypoint.sh <<'SCRIPT'
+#!/bin/sh
+set -e
+cd /var/www/html
+
+if [ -f composer.json ] && [ ! -f vendor/autoload.php ]; then
+  composer install --no-interaction --prefer-dist
+fi
+
+if [ -f .env.example ] && [ ! -f .env ]; then
+  cp .env.example .env
+  php artisan key:generate
+fi
+
+if [ -f package.json ] && [ ! -d node_modules ]; then
+  npm install
+fi
+
+if [ -f package.json ] && [ ! -f public/build/manifest.json ]; then
+  npm run build
+fi
+
+exec "$@"
+SCRIPT
+chmod +x /usr/local/bin/entrypoint.sh
+EOF
+
 WORKDIR /var/www/html
+
+EXPOSE 8000
+
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000"]
