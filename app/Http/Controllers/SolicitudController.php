@@ -173,16 +173,15 @@ class SolicitudController extends Controller
             ]);
         }
 
-        try {
-            $client = new \GuzzleHttp\Client(['timeout' => 30]);
-            $model  = config('services.gemini.model', 'gemini-3.6-flash');
-            // Quitar prefijo "models/" si viene en el config
-            $model  = str_replace('models/', '', $model);
+        // Modelos a intentar en orden (fallback si el primero está saturado)
+        $modeloPrincipal = str_replace('models/', '', config('services.gemini.model', 'gemini-3.6-flash'));
+        $modelosFallback = array_values(array_unique(array_filter([
+            $modeloPrincipal,
+            'gemini-2.5-flash',
+            'gemini-2.0-flash',
+        ])));
 
-            // API nativa de Google AI Studio (generateContent)
-            $apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
-
-            $prompt = <<<PROMPT
+        $prompt = <<<PROMPT
 Eres un asistente experto en bienestar estudiantil del SENA Colombia. Analiza la nota del aprendiz y responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin bloques de código, sin explicaciones.
 
 Clasifica la PRIORIDAD según estas reglas:
@@ -196,65 +195,81 @@ Responde SOLO este JSON (máximo 80 palabras en recomendacion):
 Nota del aprendiz: "{$nota}"
 PROMPT;
 
-            $response = $client->post($apiUrl, [
-                'headers' => ['Content-Type' => 'application/json'],
-                'json'    => [
-                    'contents' => [
-                        ['parts' => [['text' => $prompt]]]
+        $ultimoError = null;
+
+        foreach ($modelosFallback as $model) {
+            try {
+                $client = new \GuzzleHttp\Client(['timeout' => 30]);
+                $apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
+
+                $response = $client->post($apiUrl, [
+                    'headers' => ['Content-Type' => 'application/json'],
+                    'json'    => [
+                        'contents' => [
+                            ['parts' => [['text' => $prompt]]]
+                        ],
+                        'generationConfig' => [
+                            'temperature'     => 0.2,
+                            'maxOutputTokens' => 1024,
+                        ],
                     ],
-                    'generationConfig' => [
-                        'temperature'     => 0.2,
-                        'maxOutputTokens' => 1024,
-                    ],
-                ],
-            ]);
+                ]);
 
-            $body    = json_decode($response->getBody()->getContents(), true);
-            $content = $body['candidates'][0]['content']['parts'][0]['text'] ?? '';
+                $body    = json_decode($response->getBody()->getContents(), true);
+                $content = $body['candidates'][0]['content']['parts'][0]['text'] ?? '';
 
-            // Guardar respuesta cruda en log para depuración
-            \Illuminate\Support\Facades\Log::info('Gemini raw response: ' . substr($content, 0, 500));
+                \Illuminate\Support\Facades\Log::info("Gemini [{$model}] raw response: " . substr($content, 0, 500));
 
-            // Extraer el primer objeto JSON válido que aparezca en la respuesta
-            $ia = $this->extraerJson($content);
+                $ia = $this->extraerJson($content);
 
-            if (empty($ia)) {
-                throw new \RuntimeException('No se encontró JSON válido en la respuesta de la IA. Respuesta: ' . substr($content, 0, 200));
+                if (empty($ia)) {
+                    throw new \RuntimeException("No se encontró JSON válido en la respuesta. Respuesta: " . substr($content, 0, 200));
+                }
+
+                $prioridadTexto   = strtolower(trim($ia['prioridad'] ?? ''));
+                $prioridadInterna = match(true) {
+                    str_contains($prioridadTexto, 'alta') || str_contains($prioridadTexto, 'cr') => 'alta',
+                    str_contains($prioridadTexto, 'media') => 'media',
+                    default => 'baja',
+                };
+
+                return response()->json([
+                    'recomendacion'   => $ia['recomendacion'] ?? '',
+                    'prioridad'       => $prioridadInterna,
+                    'prioridad_label' => $ia['prioridad'] ?? ucfirst($prioridadInterna),
+                    'color'           => $ia['color'] ?? $this->colorPrioridad($prioridadInterna),
+                    'categoria'       => $ia['categoria'] ?? '',
+                    'modelo_usado'    => $model,
+                ]);
+
+            } catch (\GuzzleHttp\Exception\ServerException $e) {
+                // 503 / 5xx: el modelo está saturado — intentar con el siguiente
+                $statusCode  = $e->getResponse()?->getStatusCode();
+                $ultimoError = $e;
+                \Illuminate\Support\Facades\Log::warning("Gemini [{$model}] error {$statusCode}, intentando siguiente modelo...");
+                continue;
+
+            } catch (\Throwable $e) {
+                // Cualquier otro error: no tiene sentido reintentar con otro modelo
+                $ultimoError = $e;
+                \Illuminate\Support\Facades\Log::error("Gemini [{$model}] error inesperado: " . $e->getMessage());
+                break;
             }
-
-            // Mapear prioridad al formato interno (alta/media/baja)
-            $prioridadTexto   = strtolower(trim($ia['prioridad'] ?? ''));
-            $prioridadInterna = match(true) {
-                str_contains($prioridadTexto, 'alta') || str_contains($prioridadTexto, 'cr') => 'alta',
-                str_contains($prioridadTexto, 'media') => 'media',
-                default => 'baja',
-            };
-
-            return response()->json([
-                'recomendacion'   => $ia['recomendacion'] ?? '',
-                'prioridad'       => $prioridadInterna,
-                'prioridad_label' => $ia['prioridad'] ?? ucfirst($prioridadInterna),
-                'color'           => $ia['color'] ?? $this->colorPrioridad($prioridadInterna),
-                'categoria'       => $ia['categoria'] ?? '',
-            ]);
-
-        } catch (\Throwable $e) {
-            // Fallback local si la API falla
-            $prioridad     = Solicitud::calcularPrioridad($nota);
-            $recomendacion = $this->recomendacionLocal($nota, $prioridad);
-
-            \Illuminate\Support\Facades\Log::error('IA Error: ' . $e->getMessage(), [
-                'trace' => $e->getTraceAsString(),
-            ]);
-
-            return response()->json([
-                'recomendacion' => $recomendacion,
-                'prioridad'     => $prioridad,
-                'color'         => $this->colorPrioridad($prioridad),
-                'categoria'     => '',
-                'error'         => 'No se pudo conectar con la IA. Se usó análisis local. Detalle: ' . $e->getMessage(),
-            ]);
         }
+
+        // Todos los modelos fallaron — usar análisis local
+        $prioridad     = Solicitud::calcularPrioridad($nota);
+        $recomendacion = $this->recomendacionLocal($nota, $prioridad);
+
+        \Illuminate\Support\Facades\Log::error('IA fallback local activado. Último error: ' . ($ultimoError?->getMessage() ?? 'desconocido'));
+
+        return response()->json([
+            'recomendacion' => $recomendacion,
+            'prioridad'     => $prioridad,
+            'color'         => $this->colorPrioridad($prioridad),
+            'categoria'     => '',
+            'error'         => 'El servicio de IA está temporalmente saturado. Se usó análisis local automático.',
+        ]);
     }
 
     /**
